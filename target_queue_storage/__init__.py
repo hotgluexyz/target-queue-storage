@@ -4,11 +4,7 @@ import json
 import argparse
 import logging
 
-from azure.storage.queue import (
-        QueueClient,
-        BinaryBase64EncodePolicy,
-        BinaryBase64DecodePolicy
-)
+from azure.storage.queue import QueueClient
 
 logger = logging.getLogger("target-queue-storage")
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -73,11 +69,11 @@ def upload(args):
                     logger.debug(f"Queueing {len(data)} messages...")
 
                     for payload in data:
-                        message = {
+                        message = json.dumps({
                             'key': msg_key,
                             'name': file,
                             'payload': payload
-                        }
+                        })
 
                         queue_client.send_message(message)
 
