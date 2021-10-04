@@ -73,6 +73,29 @@ def upload(args):
 
                     queue_client.send_message(message)
 
+        for file in [f for f in files if f.endswith(".json")]:
+            logger.info(f"Exporting {file}")
+            file_path = os.path.join(root, file)
+
+            # Upload the file
+            with open(file_path, "r") as f:
+                # Read the JSON file
+                data = json.loads(f.read())
+
+                # Verify the data is a list
+                if isinstance(data, list):
+                    # Queue each message individually
+                    logger.debug(f"Queueing {len(data)} messages...")
+
+                    for payload in data:
+                        message = json.dumps({
+                            'key': msg_key,
+                            'name': file,
+                            'payload': payload
+                        })
+
+                        queue_client.send_message(message)
+
     logger.info(f"Data exported.")
 
 
