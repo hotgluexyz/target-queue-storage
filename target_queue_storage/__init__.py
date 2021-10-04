@@ -3,6 +3,7 @@ import os
 import json
 import argparse
 import logging
+import jsonlines
 
 from azure.storage.queue import QueueClient
 
@@ -54,28 +55,23 @@ def upload(args):
     queue_client = QueueClient.from_connection_string(connect_string, q_name)
 
     for root, dirs, files in os.walk(local_path):
-        for file in [f for f in files if f.endswith(".json")]:
+        for file in [f for f in files if f.endswith(".part")]:
             logger.info(f"Exporting {file}")
             file_path = os.path.join(root, file)
 
             # Upload the file
-            with open(file_path, "r") as f:
-                # Read the JSON file
-                data = json.loads(f.read())
+            with jsonlines.open(file_path) as reader:
+                logger.debug(f"Queueing {file_path} messages...")
 
-                # Verify the data is a list
-                if isinstance(data, list):
+                for payload in reader:
                     # Queue each message individually
-                    logger.debug(f"Queueing {len(data)} messages...")
+                    message = json.dumps({
+                        'key': msg_key,
+                        'name': file,
+                        'payload': payload
+                    })
 
-                    for payload in data:
-                        message = json.dumps({
-                            'key': msg_key,
-                            'name': file,
-                            'payload': payload
-                        })
-
-                        queue_client.send_message(message)
+                    queue_client.send_message(message)
 
     logger.info(f"Data exported.")
 

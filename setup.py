@@ -4,7 +4,7 @@ from setuptools import setup
 
 setup(
     name='target-queue-storage',
-    version='1.0.0',
+    version='1.0.1',
     description='hotglue target for exporting data to Azure Queue Storage',
     author='hotglue',
     url='https://hotglue.xyz',
@@ -12,7 +12,8 @@ setup(
     py_modules=['target_blob_storage'],
     install_requires=[
         'azure-storage-queue==12.1.6',
-        'argparse==1.4.0'
+        'argparse==1.4.0',
+        'jsonlines==2.0.0'
     ],
     entry_points='''
         [console_scripts]
