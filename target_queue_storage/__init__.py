@@ -4,6 +4,7 @@ import json
 import argparse
 import logging
 import jsonlines
+import  multiprocessing as mp
 
 from azure.storage.queue import QueueClient
 
@@ -43,6 +44,30 @@ def parse_args():
     return args
 
 
+def process_part(args):
+    # Unwrap tuple args
+    msg_key, connect_string, q_name, root, file = args
+    file_path = os.path.join(root, file)
+    # Upload all data in input_path to Azure Queue Storage
+    queue_client = QueueClient.from_connection_string(connect_string, q_name)
+
+    logger.info(f"Exporting {file_path}")
+
+    # Upload the file
+    with jsonlines.open(file_path) as reader:
+        logger.debug(f"Queueing {file_path} messages...")
+
+        for payload in reader:
+            # Queue each message individually
+            message = json.dumps({
+                'key': msg_key,
+                'name': file,
+                'payload': payload
+            })
+
+            queue_client.send_message(message)
+
+
 def upload(args):
     logger.info(f"Exporting data...")
     config = args.config
@@ -54,25 +79,14 @@ def upload(args):
     # Upload all data in input_path to Azure Queue Storage
     queue_client = QueueClient.from_connection_string(connect_string, q_name)
 
+    # Create multiprocessing pool
+    pool = mp.Pool(mp.cpu_count())
+
     for root, dirs, files in os.walk(local_path):
-        for file in [f for f in files if f.endswith(".part")]:
-            logger.info(f"Exporting {file}")
-            file_path = os.path.join(root, file)
+        # Handle queuing .part files
+        pool.map_async(process_part, [(msg_key, connect_string, q_name, root, f) for f in files if f.endswith(".part")]).get()
 
-            # Upload the file
-            with jsonlines.open(file_path) as reader:
-                logger.debug(f"Queueing {file_path} messages...")
-
-                for payload in reader:
-                    # Queue each message individually
-                    message = json.dumps({
-                        'key': msg_key,
-                        'name': file,
-                        'payload': payload
-                    })
-
-                    queue_client.send_message(message)
-
+        # Process JSON files
         for file in [f for f in files if f.endswith(".json")]:
             logger.info(f"Exporting {file}")
             file_path = os.path.join(root, file)
@@ -95,6 +109,9 @@ def upload(args):
                         })
 
                         queue_client.send_message(message)
+
+    # Close the processing pool
+    pool.close()
 
     logger.info(f"Data exported.")
 
