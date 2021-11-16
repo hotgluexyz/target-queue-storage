@@ -4,7 +4,7 @@ import json
 import argparse
 import logging
 import jsonlines
-import  multiprocessing as mp
+import multiprocessing as mp
 
 from azure.storage.queue import QueueClient
 
@@ -68,6 +68,28 @@ def process_part(args):
             queue_client.send_message(message)
 
 
+def queue_message(args):
+    # Unwrap tuple args
+    msg_key, payload, connect_string, q_name, file = args
+    # Create queue client
+    queue_client = QueueClient.from_connection_string(connect_string, q_name)
+
+    message = json.dumps({
+        'key': msg_key,
+        'name': file,
+        'payload': payload
+    })
+
+    try:
+        queue_client.send_message(message)
+    except Exception as e:
+        if "maximum permissible limit." in str(ex):
+            LOGGER.warn("Skipping message because of size limits", message)
+            pass
+        else:
+            raise ex
+
+
 def upload(args):
     logger.info(f"Exporting data...")
     config = args.config
@@ -101,14 +123,8 @@ def upload(args):
                     # Queue each message individually
                     logger.debug(f"Queueing {len(data)} messages...")
 
-                    for payload in data:
-                        message = json.dumps({
-                            'key': msg_key,
-                            'name': file,
-                            'payload': payload
-                        })
-
-                        queue_client.send_message(message)
+                    # async queue messages
+                    pool.map_async(queue_message, [(msg_key, payload, connect_string, q_name, file) for payload in data]).get()
 
     # Close the processing pool
     pool.close()
