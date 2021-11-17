@@ -9,7 +9,8 @@ import multiprocessing as mp
 from azure.storage.queue import QueueClient
 
 logger = logging.getLogger("target-queue-storage")
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger.setLevel(logging.INFO)
 
 def load_json(path):
     with open(path) as f:
@@ -55,7 +56,7 @@ def process_part(args):
 
     # Upload the file
     with jsonlines.open(file_path) as reader:
-        logger.debug(f"Queueing {file_path} messages...")
+        logger.info(f"Queueing {file_path} messages...")
 
         for payload in reader:
             # Queue each message individually
@@ -121,7 +122,7 @@ def upload(args):
                 # Verify the data is a list
                 if isinstance(data, list):
                     # Queue each message individually
-                    logger.debug(f"Queueing {len(data)} messages...")
+                    logger.info(f"Queueing {len(data)} messages...")
 
                     # async queue messages
                     pool.map_async(queue_message, [(msg_key, payload, connect_string, q_name, file) for payload in data]).get()
