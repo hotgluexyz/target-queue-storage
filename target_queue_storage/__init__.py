@@ -82,7 +82,7 @@ def queue_message(args):
 
     try:
         queue_client.send_message(message)
-    except Exception as e:
+    except Exception as ex:
         if "maximum permissible limit." in str(ex):
             LOGGER.warn("Skipping message because of size limits", message)
             pass
