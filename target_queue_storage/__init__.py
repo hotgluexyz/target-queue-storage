@@ -43,9 +43,7 @@ def parse_args():
     return args
 
 
-def queue_message(args):
-    # Unwrap tuple args
-    msg_key, payload, connect_string, q_name, file = args
+def queue_message(msg_key, payload, connect_string, q_name, file):
     # Create queue client
     queue_client = QueueClient.from_connection_string(connect_string, q_name)
 
@@ -67,10 +65,12 @@ def queue_message(args):
 
 def batch_queue(data, msg_key, connect_string, q_name, file):
     threads= []
-    with ThreadPoolExecutor(5) as executor:
+    with ThreadPoolExecutor(128) as executor:
         for payload in data:
             exc = executor.submit(queue_message, msg_key, payload, connect_string, q_name, file)
             threads.append(exc)
+        for _ in enumerate(as_completed(threads)):
+            continue
 
 
 def process_part(args):
