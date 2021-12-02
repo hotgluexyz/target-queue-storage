@@ -5,8 +5,10 @@ import argparse
 import logging
 import jsonlines
 import multiprocessing as mp
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from azure.storage.queue import QueueClient
+
 
 logger = logging.getLogger("target-queue-storage")
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -22,10 +24,6 @@ def parse_args():
     Parses the command-line arguments mentioned in the SPEC and the
     BEST_PRACTICES documents:
     -c,--config     Config file
-    -s,--state      State file
-    -d,--discover   Run in discover mode
-    -p,--properties Properties file: DEPRECATED, please use --catalog instead
-    --catalog       Catalog file
     Returns the parsed args object from argparse. For each argument that
     point to JSON files (config, state, properties), we will automatically
     load and parse the JSON file.
@@ -45,33 +43,7 @@ def parse_args():
     return args
 
 
-def process_part(args):
-    # Unwrap tuple args
-    msg_key, connect_string, q_name, root, file = args
-    file_path = os.path.join(root, file)
-    # Upload all data in input_path to Azure Queue Storage
-    queue_client = QueueClient.from_connection_string(connect_string, q_name)
-
-    logger.info(f"Exporting {file_path}")
-
-    # Upload the file
-    with jsonlines.open(file_path) as reader:
-        logger.info(f"Queueing {file_path} messages...")
-
-        for payload in reader:
-            # Queue each message individually
-            message = json.dumps({
-                'key': msg_key,
-                'name': file,
-                'payload': payload
-            })
-
-            queue_client.send_message(message)
-
-
-def queue_message(args):
-    # Unwrap tuple args
-    msg_key, payload, connect_string, q_name, file = args
+def queue_message(msg_key, payload, connect_string, q_name, file):
     # Create queue client
     queue_client = QueueClient.from_connection_string(connect_string, q_name)
 
@@ -91,6 +63,30 @@ def queue_message(args):
             raise ex
 
 
+def batch_queue(data, msg_key, connect_string, q_name, file):
+    threads= []
+    with ThreadPoolExecutor(128) as executor:
+        for payload in data:
+            exc = executor.submit(queue_message, msg_key, payload, connect_string, q_name, file)
+            threads.append(exc)
+        for _ in enumerate(as_completed(threads)):
+            continue
+
+
+def process_part(args):
+    # Unwrap tuple args
+    msg_key, connect_string, q_name, root, file = args
+    file_path = os.path.join(root, file)
+    # Upload all data in input_path to Azure Queue Storage
+
+    logger.info(f"Exporting {file_path}")
+
+    # Upload the file
+    with jsonlines.open(file_path) as reader:
+        logger.info(f"Queueing {file_path} messages...")
+        batch_queue(reader, msg_key, connect_string, q_name, file)
+
+
 def upload(args):
     logger.info(f"Exporting data...")
     config = args.config
@@ -98,9 +94,6 @@ def upload(args):
     local_path = config['input_path']
     connect_string = config['connect_string']
     msg_key = config['path_prefix']
-
-    # Upload all data in input_path to Azure Queue Storage
-    queue_client = QueueClient.from_connection_string(connect_string, q_name)
 
     # Create multiprocessing pool
     pool = mp.Pool(mp.cpu_count())
@@ -123,9 +116,8 @@ def upload(args):
                 if isinstance(data, list):
                     # Queue each message individually
                     logger.info(f"Queueing {len(data)} messages...")
-
                     # async queue messages
-                    pool.map_async(queue_message, [(msg_key, payload, connect_string, q_name, file) for payload in data]).get()
+                    batch_queue(data, msg_key, connect_string, q_name, file)
 
     # Close the processing pool
     pool.close()

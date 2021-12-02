@@ -4,7 +4,7 @@ from setuptools import setup
 
 setup(
     name='target-queue-storage',
-    version='1.0.5',
+    version='1.0.6',
     description='hotglue target for exporting data to Azure Queue Storage',
     author='hotglue',
     url='https://hotglue.xyz',
