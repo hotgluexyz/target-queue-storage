@@ -43,33 +43,38 @@ def parse_args():
     return args
 
 
-def queue_message(msg_key, payload, connect_string, q_name, file):
+def queue_message(msg_key, acc_payload, connect_string, q_name, file):
     # Create queue client
     queue_client = QueueClient.from_connection_string(connect_string, q_name)
+    
+    for payload in acc_payload:
+        message = json.dumps({
+            'key': msg_key,
+            'name': file,
+            'payload': payload
+        })
 
-    message = json.dumps({
-        'key': msg_key,
-        'name': file,
-        'payload': payload
-    })
-
-    try:
-        queue_client.send_message(message)
-    except Exception as ex:
-        if "maximum permissible limit." in str(ex):
-            logger.warn("Skipping message because of size limits.")
-            pass
-        else:
-            raise ex
+        try:
+            queue_client.send_message(message)
+        except Exception as ex:
+            if "maximum permissible limit." in str(ex):
+                logger.warn("Skipping message because of size limits.")
+                pass
+            else:
+                raise ex
 
 
-def batch_queue(data, msg_key, connect_string, q_name, file):
+def batch_queue(data, msg_key, connect_string, q_name, file, chunk=512):
     threads= []
-    with ThreadPoolExecutor(128) as executor:
+    with ThreadPoolExecutor(36) as executor:
+        acc_payload = []
         for payload in data:
-            exc = executor.submit(queue_message, msg_key, payload, connect_string, q_name, file)
-            threads.append(exc)
-        for _ in enumerate(as_completed(threads)):
+            acc_payload.append(payload)
+            if len(acc_payload)>=chunk:
+                exc = executor.submit(queue_message, msg_key, acc_payload, connect_string, q_name, file)
+                threads.append(exc)
+                acc_payload=[]
+        for task in as_completed(threads):
             continue
 
 
