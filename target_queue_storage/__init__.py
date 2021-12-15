@@ -47,6 +47,7 @@ def queue_message(msg_key, acc_payload, connect_string, q_name, file):
     # Create queue client
     queue_client = QueueClient.from_connection_string(connect_string, q_name)
     
+    payloads_sent = 0
     for payload in acc_payload:
         message = json.dumps({
             'key': msg_key,
@@ -55,18 +56,21 @@ def queue_message(msg_key, acc_payload, connect_string, q_name, file):
         })
 
         try:
-            queue_client.send_message(message)
+            status = queue_client.send_message(message)
+            payloads_sent = payloads_sent + 1
         except Exception as ex:
             if "maximum permissible limit." in str(ex):
                 logger.warn("Skipping message because of size limits.")
                 pass
             else:
                 raise ex
+    return payloads_sent
 
 
 def batch_queue(data, msg_key, connect_string, q_name, file, chunk=512):
     threads= []
-    with ThreadPoolExecutor(36) as executor:
+    queues_count = 0
+    with ThreadPoolExecutor(16) as executor:
         acc_payload = []
         for payload in data:
             acc_payload.append(payload)
@@ -74,8 +78,12 @@ def batch_queue(data, msg_key, connect_string, q_name, file, chunk=512):
                 exc = executor.submit(queue_message, msg_key, acc_payload, connect_string, q_name, file)
                 threads.append(exc)
                 acc_payload=[]
+        exc = executor.submit(queue_message, msg_key, acc_payload, connect_string, q_name, file)
+        threads.append(exc)
         for task in as_completed(threads):
-            continue
+            queues_count += task.result()
+    logger.info(f"{queues_count} Queues sent to {q_name} from {file}")
+
 
 
 def process_part(args):
