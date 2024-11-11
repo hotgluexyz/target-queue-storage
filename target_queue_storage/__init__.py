@@ -63,7 +63,7 @@ def queue_message(msg_key, acc_payload, connect_string, q_name, file):
                 logger.warn("Skipping message because of size limits.")
                 pass
             else:
-                raise ex
+                raise Exception(f"{ex.__str__()}")
     return payloads_sent
 
 
