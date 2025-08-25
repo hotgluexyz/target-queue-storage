@@ -1,0 +1,11 @@
+{
+    "configurations": [
+        {
+            "name": "Python Debugger: target_queue_storage.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "target_queue_storage/__init__.py",
+            "args": "-c .secrets/config.json"
+        }
+    ]
+}
