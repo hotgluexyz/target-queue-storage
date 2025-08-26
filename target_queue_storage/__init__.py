@@ -7,14 +7,8 @@ import logging
 import threading
 import time
 import jsonlines
-import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from azure.storage.queue.aio import QueueClient
-
-import timeit
-
-from async_token_bucket import AsyncTokenBucket
 
 logger = logging.getLogger("target-queue-storage")
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -51,24 +45,25 @@ def parse_args():
 _queue_client = None
 _lock = threading.Lock()
 
+# Concurrency semaphore (initialized in upload)
+inflight_semaphore = None
+
 def get_queue_client(connect_string, q_name):
     global _queue_client
     if _queue_client is None:
-        # with _lock:
-        #     if _queue_client is None:
         _queue_client = QueueClient.from_connection_string(connect_string, q_name)
     return _queue_client
 
-limiter = AsyncTokenBucket(rate=20000, capacity=20000)
-
-async def send_one(p, msg_key, file, client, message_num=None):
-    await limiter.acquire()
-    try:
-        await client.send_message(json.dumps({'key': msg_key, 'name': file, 'payload': p}))
-        return True
-    except Exception as e:
-        logger.error(f"Error sending message {message_num} from {file}: {e}")
-        return False
+async def send_one(p, msg_key, file, client):
+    async with inflight_semaphore:
+        try:
+            payload_obj = {'key': msg_key, 'name': file, 'payload': p}
+            payload_str = json.dumps(payload_obj)
+            await client.send_message(payload_str)
+            return True
+        except Exception as e:
+            logger.error(f"Error sending message from {file}: {e}")
+            return False
 
 def process_part(args):
     # Unwrap tuple args
@@ -87,7 +82,7 @@ def process_part(args):
         logger.info(f"Creating {total_messages} tasks for {file}")
         
         # Create tasks for all messages
-        tasks = [send_one(p, msg_key, file, client, i+1) for i, p in enumerate(data)]
+        tasks = [asyncio.create_task(send_one(p, msg_key, file, client)) for p in data]
         return tasks
 
 
@@ -111,7 +106,7 @@ def process_json(args):
             logger.info(f"Creating {total_messages} tasks for {file}")
             
             # Create tasks for all messages
-            tasks = [send_one(p, msg_key, file, client, i+1) for i, p in enumerate(data)]
+            tasks = [asyncio.create_task(send_one(p, msg_key, file, client)) for p in data]
             return tasks
         else:
             logger.warning(f"JSON file {file} does not contain a list, skipping...")
@@ -154,6 +149,10 @@ async def upload(args):
 
     client = get_queue_client(connect_string, q_name)
     async with client:
+        global inflight_semaphore
+        max_concurrency = int(config.get('max_concurrency', 1000))
+        inflight_semaphore = asyncio.Semaphore(max_concurrency)
+
         all_tasks = []
         for root, _, files in os.walk(local_path):
             # Handle queuing .part and .json files concurrently
