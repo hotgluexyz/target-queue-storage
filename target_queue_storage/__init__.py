@@ -54,55 +54,25 @@ _lock = threading.Lock()
 def get_queue_client(connect_string, q_name):
     global _queue_client
     if _queue_client is None:
-        with _lock:
-            if _queue_client is None:
-                logger.info("Making client")
-                _queue_client = QueueClient.from_connection_string(connect_string, q_name)
+        # with _lock:
+        #     if _queue_client is None:
+        _queue_client = QueueClient.from_connection_string(connect_string, q_name)
     return _queue_client
 
 limiter = AsyncTokenBucket(rate=20000, capacity=20000)
 
-async def send_all(payloads, conn_str, q_name, msg_key, file):
-    time_start = time.perf_counter(), time.process_time()
-    logger.info(f"Sending {len(payloads)} messages...")
-    client = QueueClient.from_connection_string(conn_str, q_name)
-    successes = 0
-    errors = 0
+async def send_one(p, msg_key, file, client, message_num=None):
+    await limiter.acquire()
+    try:
+        await client.send_message(json.dumps({'key': msg_key, 'name': file, 'payload': p}))
+        return True
+    except Exception as e:
+        logger.error(f"Error sending message {message_num} from {file}: {e}")
+        return False
 
-    async with client:
-        async def send_one(p):
-            nonlocal successes, errors
-            msg = json.dumps({'key': msg_key, 'name': file, 'payload': p})
-            await limiter.acquire()
-            try:
-                await client.send_message(msg)
-                successes += 1
-            except Exception:
-                errors += 1
-
-        tasks = [asyncio.create_task(send_one(p)) for p in payloads]
-
-        for fut in asyncio.as_completed(tasks):
-            await fut
-
-    time_end = time.perf_counter(), time.process_time()
-    logger.info(f"Time taken: {time_end[0] - time_start[0]} seconds, {time_end[1] - time_start[1]} seconds")
-
-    return successes, errors
-
-async def batch_queue(data, msg_key, connect_string, q_name, file, chunk=512):
-    acc_payload = []
-    for payload in data:
-        acc_payload.append(payload)
-        if len(acc_payload)>=chunk:
-            await send_all(acc_payload, connect_string, q_name, msg_key, file)            
-            acc_payload=[]
-
-    await send_all(acc_payload, connect_string, q_name, msg_key, file)
-
-async def process_part(args):
+def process_part(args):
     # Unwrap tuple args
-    msg_key, connect_string, q_name, root, file = args
+    msg_key, root, file, client = args
     file_path = os.path.join(root, file)
     # Upload all data in input_path to Azure Queue Storage
 
@@ -111,7 +81,64 @@ async def process_part(args):
     # Upload the file
     with jsonlines.open(file_path) as reader:
         logger.info(f"Queueing {file_path} messages...")
-        await batch_queue(reader, msg_key, connect_string, q_name, file)
+        # Convert reader to list to get count and create tasks for all messages
+        data = list(reader)
+        total_messages = len(data)
+        logger.info(f"Creating {total_messages} tasks for {file}")
+        
+        # Create tasks for all messages
+        tasks = [send_one(p, msg_key, file, client, i+1) for i, p in enumerate(data)]
+        return tasks
+
+
+def process_json(args):
+    # Unwrap tuple args
+    msg_key, root, file, client = args
+    file_path = os.path.join(root, file)
+    # Upload all data in input_path to Azure Queue Storage
+
+    logger.info(f"Exporting {file_path}")
+
+    # Upload the file
+    with open(file_path, "r") as f:
+        # Read the JSON file
+        data = json.loads(f.read())
+
+        # Verify the data is a list
+        if isinstance(data, list):
+            # Queue each message individually
+            total_messages = len(data)
+            logger.info(f"Creating {total_messages} tasks for {file}")
+            
+            # Create tasks for all messages
+            tasks = [send_one(p, msg_key, file, client, i+1) for i, p in enumerate(data)]
+            return tasks
+        else:
+            logger.warning(f"JSON file {file} does not contain a list, skipping...")
+            return []
+
+
+async def monitor_progress(completed_counter, total_tasks):
+    """Monitor progress of tasks and log every 2 seconds"""
+    start_time = time.perf_counter()
+    
+    while completed_counter['count'] < total_tasks:
+        await asyncio.sleep(2)
+        
+        completed = completed_counter['count']
+        
+        if completed < total_tasks:
+            elapsed = time.perf_counter() - start_time
+            progress = (completed / total_tasks) * 100
+            remaining = total_tasks - completed
+            
+            # Estimate remaining time
+            if completed > 0:
+                rate = completed / elapsed
+                eta = remaining / rate if rate > 0 else 0
+                logger.info(f"Progress: {completed}/{total_tasks} ({progress:.1f}%) - {remaining} remaining - ETA: {eta:.1f}s")
+            else:
+                logger.info(f"Progress: {completed}/{total_tasks} ({progress:.1f}%) - {remaining} remaining")
 
 
 async def upload(args):
@@ -125,27 +152,50 @@ async def upload(args):
     connect_string = config['connect_string']
     msg_key = config['path_prefix']
 
-
-    for root, dirs, files in os.walk(local_path):
-        # Handle queuing .part files
-        await asyncio.gather(*[process_part((msg_key, connect_string, q_name, root, f)) for f in files if f.endswith(".part")])
-
-        # Process JSON files
-        for file in [f for f in files if f.endswith(".json")]:
-            logger.info(f"Exporting {file}")
-            file_path = os.path.join(root, file)
-
-            # Upload the file
-            with open(file_path, "r") as f:
-                # Read the JSON file
-                data = json.loads(f.read())
-
-                # Verify the data is a list
-                if isinstance(data, list):
-                    # Queue each message individually
-                    logger.info(f"Queueing {len(data)} messages...")
-                    # async queue messages
-                    await batch_queue(data, msg_key, connect_string, q_name, file)
+    client = get_queue_client(connect_string, q_name)
+    async with client:
+        all_tasks = []
+        for root, _, files in os.walk(local_path):
+            # Handle queuing .part and .json files concurrently
+            part_files = [f for f in files if f.endswith(".part")]
+            json_files = [f for f in files if f.endswith(".json")]
+            
+            # Collect tasks from all files
+            for f in part_files:
+                tasks = process_part((msg_key, root, f, client))
+                all_tasks.extend(tasks)
+            
+            for f in json_files:
+                tasks = process_json((msg_key, root, f, client))
+                all_tasks.extend(tasks)
+        
+        if all_tasks:
+            total_tasks = len(all_tasks)
+            logger.info(f"Starting to send {total_tasks} total messages...")
+            
+            # Create a shared counter for progress monitoring
+            completed_counter = {'count': 0}
+            
+            # Start progress monitoring task
+            progress_task = asyncio.create_task(monitor_progress(completed_counter, total_tasks))
+            
+            # Execute all tasks with progress tracking
+            results = []
+            for coro in asyncio.as_completed(all_tasks):
+                result = await coro
+                results.append(result)
+                completed_counter['count'] += 1
+            
+            # Cancel progress monitoring
+            progress_task.cancel()
+            
+            # Count total successes and errors
+            total_successes = sum(1 for result in results if result)
+            total_errors = sum(1 for result in results if not result)
+            
+            logger.info(f"All processing completed: {total_successes} messages sent, {total_errors} failed")
+        else:
+            logger.info("No files to process")
 
     end_time = time.perf_counter()
     end_process_time = time.process_time()
@@ -157,7 +207,6 @@ async def upload(args):
     logger.info(f"Total upload time - Wall time: {total_wall_time:.2f} seconds, Process time: {total_process_time:.2f} seconds")
     
     return total_wall_time, total_process_time
-
 
 def main():
     # Parse command line arguments
