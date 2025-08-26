@@ -13,7 +13,8 @@ setup(
     install_requires=[
         'azure-storage-queue==12.1.6',
         'argparse==1.4.0',
-        'jsonlines==2.0.0'
+        'jsonlines==2.0.0',
+        'aiohttp==3.12.15'
     ],
     entry_points='''
         [console_scripts]
