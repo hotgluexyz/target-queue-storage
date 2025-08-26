@@ -150,7 +150,7 @@ async def upload(args):
     client = get_queue_client(connect_string, q_name)
     async with client:
         global inflight_semaphore
-        max_concurrency = int(config.get('max_concurrency', 10000))
+        max_concurrency = int(config.get('max_concurrency', 1000))
         inflight_semaphore = asyncio.Semaphore(max_concurrency)
 
         all_tasks = []
