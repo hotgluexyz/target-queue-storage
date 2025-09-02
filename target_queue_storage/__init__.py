@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
+import asyncio
 import os
 import json
 import argparse
 import logging
+import threading
+import time
 import jsonlines
-import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from azure.storage.queue import QueueClient
-
+from azure.storage.queue.aio import QueueClient
 
 logger = logging.getLogger("target-queue-storage")
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -42,53 +42,32 @@ def parse_args():
 
     return args
 
+_queue_client = None
+_lock = threading.Lock()
 
-def queue_message(msg_key, acc_payload, connect_string, q_name, file):
-    # Create queue client
-    queue_client = QueueClient.from_connection_string(connect_string, q_name)
-    
-    payloads_sent = 0
-    for payload in acc_payload:
-        message = json.dumps({
-            'key': msg_key,
-            'name': file,
-            'payload': payload
-        })
+# Concurrency semaphore (initialized in upload)
+inflight_semaphore = None
 
+def get_queue_client(connect_string, q_name):
+    global _queue_client
+    if _queue_client is None:
+        _queue_client = QueueClient.from_connection_string(connect_string, q_name)
+    return _queue_client
+
+async def send_one(p, msg_key, file, client):
+    async with inflight_semaphore:
         try:
-            status = queue_client.send_message(message)
-            payloads_sent = payloads_sent + 1
-        except Exception as ex:
-            if "maximum permissible limit." in str(ex):
-                logger.warn("Skipping message because of size limits.")
-                pass
-            else:
-                raise Exception(f"{ex.__str__()}")
-    return payloads_sent
-
-
-def batch_queue(data, msg_key, connect_string, q_name, file, chunk=512):
-    threads= []
-    queues_count = 0
-    with ThreadPoolExecutor(16) as executor:
-        acc_payload = []
-        for payload in data:
-            acc_payload.append(payload)
-            if len(acc_payload)>=chunk:
-                exc = executor.submit(queue_message, msg_key, acc_payload, connect_string, q_name, file)
-                threads.append(exc)
-                acc_payload=[]
-        exc = executor.submit(queue_message, msg_key, acc_payload, connect_string, q_name, file)
-        threads.append(exc)
-        for task in as_completed(threads):
-            queues_count += task.result()
-    logger.info(f"{queues_count} Queues sent to {q_name} from {file}")
-
-
+            payload_obj = {'key': msg_key, 'name': file, 'payload': p}
+            payload_str = json.dumps(payload_obj)
+            await client.send_message(payload_str)
+            return True
+        except Exception as e:
+            logger.error(f"Error sending message from {file}: {e}")
+            return False
 
 def process_part(args):
     # Unwrap tuple args
-    msg_key, connect_string, q_name, root, file = args
+    msg_key, root, file, client = args
     file_path = os.path.join(root, file)
     # Upload all data in input_path to Azure Queue Storage
 
@@ -97,10 +76,70 @@ def process_part(args):
     # Upload the file
     with jsonlines.open(file_path) as reader:
         logger.info(f"Queueing {file_path} messages...")
-        batch_queue(reader, msg_key, connect_string, q_name, file)
+        # Convert reader to list to get count and create tasks for all messages
+        data = list(reader)
+        total_messages = len(data)
+        logger.info(f"Creating {total_messages} tasks for {file}")
+        
+        # Create tasks for all messages
+        tasks = [asyncio.create_task(send_one(p, msg_key, file, client)) for p in data]
+        return tasks
 
 
-def upload(args):
+def process_json(args):
+    # Unwrap tuple args
+    msg_key, root, file, client = args
+    file_path = os.path.join(root, file)
+    # Upload all data in input_path to Azure Queue Storage
+
+    logger.info(f"Exporting {file_path}")
+
+    # Upload the file
+    with open(file_path, "r") as f:
+        # Read the JSON file
+        data = json.loads(f.read())
+
+        # Verify the data is a list
+        if isinstance(data, list):
+            # Queue each message individually
+            total_messages = len(data)
+            logger.info(f"Creating {total_messages} tasks for {file}")
+            
+            # Create tasks for all messages
+            tasks = [asyncio.create_task(send_one(p, msg_key, file, client)) for p in data]
+            return tasks
+        else:
+            logger.warning(f"JSON file {file} does not contain a list, skipping...")
+            return []
+
+
+async def monitor_progress(completed_counter, total_tasks):
+    """Monitor progress of tasks and log every 2 seconds"""
+    start_time = time.perf_counter()
+    
+    while completed_counter['count'] < total_tasks:
+        await asyncio.sleep(2)
+        
+        completed = completed_counter['count']
+        
+        if completed < total_tasks:
+            elapsed = time.perf_counter() - start_time
+            progress = (completed / total_tasks) * 100
+            remaining = total_tasks - completed
+            
+            # Estimate remaining time
+            if completed > 0:
+                rate = completed / elapsed
+                eta = remaining / rate if rate > 0 else 0
+                logger.info(f"Progress: {completed}/{total_tasks} ({progress:.1f}%) - {remaining} remaining - ETA: {eta:.1f}s")
+            else:
+                logger.info(f"Progress: {completed}/{total_tasks} ({progress:.1f}%) - {remaining} remaining")
+
+
+async def upload(args):
+    start_time = time.perf_counter()
+    start_process_time = time.process_time()
+    
     logger.info(f"Exporting data...")
     config = args.config
     q_name = config['queue']
@@ -108,43 +147,73 @@ def upload(args):
     connect_string = config['connect_string']
     msg_key = config['path_prefix']
 
-    # Create multiprocessing pool
-    pool = mp.Pool(mp.cpu_count())
+    client = get_queue_client(connect_string, q_name)
+    async with client:
+        global inflight_semaphore
+        max_concurrency = int(config.get('max_concurrency', 1000))
+        inflight_semaphore = asyncio.Semaphore(max_concurrency)
 
-    for root, dirs, files in os.walk(local_path):
-        # Handle queuing .part files
-        pool.map_async(process_part, [(msg_key, connect_string, q_name, root, f) for f in files if f.endswith(".part")]).get()
+        all_tasks = []
+        for root, _, files in os.walk(local_path):
+            # Handle queuing .part and .json files concurrently
+            part_files = [f for f in files if f.endswith(".part")]
+            json_files = [f for f in files if f.endswith(".json")]
+            
+            # Collect tasks from all files
+            for f in part_files:
+                tasks = process_part((msg_key, root, f, client))
+                all_tasks.extend(tasks)
+            
+            for f in json_files:
+                tasks = process_json((msg_key, root, f, client))
+                all_tasks.extend(tasks)
+        
+        if all_tasks:
+            total_tasks = len(all_tasks)
+            logger.info(f"Starting to send {total_tasks} total messages...")
+            
+            # Create a shared counter for progress monitoring
+            completed_counter = {'count': 0}
+            
+            # Start progress monitoring task
+            progress_task = asyncio.create_task(monitor_progress(completed_counter, total_tasks))
+            
+            # Execute all tasks with progress tracking
+            results = []
+            for coro in asyncio.as_completed(all_tasks):
+                result = await coro
+                results.append(result)
+                completed_counter['count'] += 1
+            
+            # Cancel progress monitoring
+            progress_task.cancel()
+            
+            # Count total successes and errors
+            total_successes = sum(1 for result in results if result)
+            total_errors = sum(1 for result in results if not result)
+            
+            logger.info(f"All processing completed: {total_successes} messages sent, {total_errors} failed")
+        else:
+            logger.info("No files to process")
 
-        # Process JSON files
-        for file in [f for f in files if f.endswith(".json")]:
-            logger.info(f"Exporting {file}")
-            file_path = os.path.join(root, file)
-
-            # Upload the file
-            with open(file_path, "r") as f:
-                # Read the JSON file
-                data = json.loads(f.read())
-
-                # Verify the data is a list
-                if isinstance(data, list):
-                    # Queue each message individually
-                    logger.info(f"Queueing {len(data)} messages...")
-                    # async queue messages
-                    batch_queue(data, msg_key, connect_string, q_name, file)
-
-    # Close the processing pool
-    pool.close()
-
+    end_time = time.perf_counter()
+    end_process_time = time.process_time()
+    
+    total_wall_time = end_time - start_time
+    total_process_time = end_process_time - start_process_time
+    
     logger.info(f"Data exported.")
-
+    logger.info(f"Total upload time - Wall time: {total_wall_time:.2f} seconds, Process time: {total_process_time:.2f} seconds")
+    
+    return total_wall_time, total_process_time
 
 def main():
     # Parse command line arguments
     args = parse_args()
 
     # Upload the data
-    upload(args)
-
+    # print(timeit.repeat(lambda: asyncio.run(upload(args)), repeat=3, number=3))
+    asyncio.run(upload(args))
 
 if __name__ == "__main__":
     main()
