@@ -54,7 +54,7 @@ def get_queue_client(connect_string, q_name):
         _queue_client = QueueClient.from_connection_string(connect_string, q_name)
     return _queue_client
 
-async def send_one(p, msg_key, file, client):
+async def send_one(p, msg_key, file, client, retry_count=0):
     async with inflight_semaphore:
         try:
             payload_obj = {'key': msg_key, 'name': file, 'payload': p}
@@ -63,6 +63,9 @@ async def send_one(p, msg_key, file, client):
             return True
         except Exception as e:
             logger.error(f"Error sending message from {file}: {e}")
+            if retry_count < 3:
+                await asyncio.sleep(2 ** retry_count)
+                return await send_one(p, msg_key, file, client, retry_count + 1)
             return False
 
 def process_part(args):
@@ -82,7 +85,7 @@ def process_part(args):
         logger.info(f"Creating {total_messages} tasks for {file}")
         
         # Create tasks for all messages
-        tasks = [asyncio.create_task(send_one(p, msg_key, file, client)) for p in data]
+        tasks = [send_one(p, msg_key, file, client) for p in data]
         return tasks
 
 
@@ -106,7 +109,7 @@ def process_json(args):
             logger.info(f"Creating {total_messages} tasks for {file}")
             
             # Create tasks for all messages
-            tasks = [asyncio.create_task(send_one(p, msg_key, file, client)) for p in data]
+            tasks = [send_one(p, msg_key, file, client) for p in data]
             return tasks
         else:
             logger.warning(f"JSON file {file} does not contain a list, skipping...")
@@ -180,19 +183,19 @@ async def upload(args):
             
             # Execute all tasks with progress tracking
             results = []
+            total_successes = 0
+            total_failures = 0
             for coro in asyncio.as_completed(all_tasks):
                 result = await coro
                 results.append(result)
+                total_successes += 1 if result else 0
+                total_failures += 1 if not result else 0
                 completed_counter['count'] += 1
             
             # Cancel progress monitoring
             progress_task.cancel()
             
-            # Count total successes and errors
-            total_successes = sum(1 for result in results if result)
-            total_errors = sum(1 for result in results if not result)
-            
-            logger.info(f"All processing completed: {total_successes} messages sent, {total_errors} failed")
+            logger.info(f"All processing completed: {total_successes} messages sent, {total_failures} failed")
         else:
             logger.info("No files to process")
 
