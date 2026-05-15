@@ -8,6 +8,7 @@ import threading
 import time
 import jsonlines
 
+from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from azure.storage.queue.aio import QueueClient
 
 logger = logging.getLogger("target-queue-storage")
@@ -42,6 +43,8 @@ def parse_args():
 
     return args
 
+MAX_RETRIES = 3
+
 _queue_client = None
 _lock = threading.Lock()
 
@@ -54,6 +57,12 @@ def get_queue_client(connect_string, q_name):
         _queue_client = QueueClient.from_connection_string(connect_string, q_name)
     return _queue_client
 
+def _http_error_summary(e: HttpResponseError) -> str:
+    """Return 'HTTP {status} {ErrorCode}', using the error_code set by the Storage SDK."""
+    error_code = getattr(e, "error_code", None)
+    code = error_code.value if error_code else e.reason
+    return f"HTTP {e.status_code} {code}"
+
 async def send_one(p, msg_key, file, client, retry_count=0):
     async with inflight_semaphore:
         try:
@@ -62,11 +71,17 @@ async def send_one(p, msg_key, file, client, retry_count=0):
             await client.send_message(payload_str)
             return True
         except Exception as e:
-            logger.error(f"Error sending message from {file}: {e}")
-            if retry_count < 3:
-                await asyncio.sleep(2 ** retry_count)
-                return await send_one(p, msg_key, file, client, retry_count + 1)
-            return False
+            summary = _http_error_summary(e) if isinstance(e, HttpResponseError) else str(e)
+            if isinstance(e, ClientAuthenticationError):
+                logger.error(f"Authentication error for {file} ({summary}): check your connection string")
+                return False
+            if retry_count >= MAX_RETRIES:
+                logger.error(f"Failed to send message from {file} after {retry_count + 1} attempts: {summary}")
+                return False
+            logger.warning(f"Transient error sending message from {file}, attempt {retry_count + 1}/{MAX_RETRIES + 1}: {summary}, retrying...")
+
+    await asyncio.sleep(2 ** retry_count)
+    return await send_one(p, msg_key, file, client, retry_count + 1)
 
 def process_part(args):
     # Unwrap tuple args
@@ -196,6 +211,8 @@ async def upload(args):
             progress_task.cancel()
             
             logger.info(f"All processing completed: {total_successes} messages sent, {total_failures} failed")
+            if total_failures > 0:
+                raise RuntimeError(f"Export failed: {total_failures}/{total_tasks} messages could not be sent to the queue")
         else:
             logger.info("No files to process")
 
