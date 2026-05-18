@@ -11,7 +11,7 @@ setup(
     classifiers=['Programming Language :: Python :: 3 :: Only'],
     py_modules=['target_blob_storage'],
     install_requires=[
-        'azure-storage-queue==12.1.6',
+        'azure-storage-queue==12.16.0',
         'argparse==1.4.0',
         'jsonlines==2.0.0',
         'aiohttp==3.12.15'

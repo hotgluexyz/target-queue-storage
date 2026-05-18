@@ -59,9 +59,8 @@ def get_queue_client(connect_string, q_name):
 
 def _http_error_summary(e: HttpResponseError) -> str:
     """Return 'HTTP {status} {ErrorCode}', using the error_code set by the Storage SDK."""
-    error_code = getattr(e, "error_code", None)
-    code = error_code.value if error_code else e.reason
-    return f"HTTP {e.status_code} {code}"
+    error_code = getattr(e, "error_code", "")
+    return f"HTTP {e.status_code} {error_code} ({e.reason})"
 
 async def send_one(p, msg_key, file, client, retry_count=0):
     async with inflight_semaphore:
