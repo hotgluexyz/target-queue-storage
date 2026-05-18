@@ -59,8 +59,8 @@ def get_queue_client(connect_string, q_name):
 
 def _http_error_summary(e: HttpResponseError) -> str:
     """Return 'HTTP {status} [{error_code}] ({reason})', omitting error_code when absent."""
-    error_code = getattr(e, "error_code", None)
-    error_code = f" {error_code}" if error_code else ""
+    raw = getattr(e, "error_code", None)
+    error_code = f" {getattr(raw, 'value', raw)}" if raw else ""
     return f"HTTP {e.status_code}{error_code} ({e.reason})"
 
 async def send_one(p, msg_key, file, client, retry_count=0):
