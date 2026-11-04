@@ -20,5 +20,11 @@ setup(
         [console_scripts]
         target-queue-storage=target_queue_storage:main
     ''',
-    packages=['target_queue_storage']
+    packages=['target_queue_storage'],
+    extras_require={
+        'test': [
+            'pytest>=7.0.0',
+            'pytest-asyncio>=0.21.0',
+        ],
+    },
 )
