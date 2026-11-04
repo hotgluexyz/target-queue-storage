@@ -4,7 +4,6 @@ import os
 import json
 import argparse
 import logging
-import threading
 import time
 import jsonlines
 
@@ -46,7 +45,6 @@ def parse_args():
 MAX_RETRIES = 3
 
 _queue_client = None
-_lock = threading.Lock()
 
 # Concurrency semaphore (initialized in upload)
 inflight_semaphore = None
@@ -83,81 +81,98 @@ async def send_one(p, msg_key, file, client, retry_count=0):
     await asyncio.sleep(2 ** retry_count)
     return await send_one(p, msg_key, file, client, retry_count + 1)
 
-def process_part(args):
-    # Unwrap tuple args
-    msg_key, root, file, client = args
-    file_path = os.path.join(root, file)
-    # Upload all data in input_path to Azure Queue Storage
 
-    logger.info(f"Exporting {file_path}")
-
-    # Upload the file
-    with jsonlines.open(file_path) as reader:
-        logger.info(f"Queueing {file_path} messages...")
-        # Convert reader to list to get count and create tasks for all messages
-        data = list(reader)
-        total_messages = len(data)
-        logger.info(f"Creating {total_messages} tasks for {file}")
-        
-        # Create tasks for all messages
-        tasks = [send_one(p, msg_key, file, client) for p in data]
-        return tasks
+def _collect_export_files(local_path):
+    """Return sorted (file_path, file_name, kind) tuples for .part and .json inputs."""
+    entries = []
+    for root, _, files in os.walk(local_path):
+        for name in files:
+            if name.endswith(".part"):
+                entries.append((os.path.join(root, name), name, "part"))
+            elif name.endswith(".json"):
+                entries.append((os.path.join(root, name), name, "json"))
+    entries.sort(key=lambda item: item[0])
+    return entries
 
 
-def process_json(args):
-    # Unwrap tuple args
-    msg_key, root, file, client = args
-    file_path = os.path.join(root, file)
-    # Upload all data in input_path to Azure Queue Storage
-
-    logger.info(f"Exporting {file_path}")
-
-    # Upload the file
-    with open(file_path, "r") as f:
-        # Read the JSON file
-        data = json.loads(f.read())
-
-        # Verify the data is a list
-        if isinstance(data, list):
-            # Queue each message individually
-            total_messages = len(data)
-            logger.info(f"Creating {total_messages} tasks for {file}")
-            
-            # Create tasks for all messages
-            tasks = [send_one(p, msg_key, file, client) for p in data]
-            return tasks
+def _count_task_results(done_tasks):
+    """Return (successes, failures) tallies from completed asyncio tasks."""
+    successes = failures = 0
+    for task in done_tasks:
+        if task.result():
+            successes += 1
         else:
-            logger.warning(f"JSON file {file} does not contain a list, skipping...")
-            return []
+            failures += 1
+    return successes, failures
 
 
-async def monitor_progress(completed_counter, total_tasks):
-    """Monitor progress of tasks and log every 2 seconds"""
+async def export_records(record_iter, msg_key, file_name, client, max_concurrency, stats=None):
+    """Send each record to the queue, keeping at most max_concurrency sends active at once."""
+    pending = set()
+    successes = failures = 0
+
+    def record_results(done_tasks):
+        nonlocal successes, failures
+        s, f = _count_task_results(done_tasks)
+        successes += s
+        failures += f
+        if stats is not None:
+            stats["successes"] += s
+            stats["failures"] += f
+
+    for record in record_iter:
+        pending.add(asyncio.create_task(send_one(record, msg_key, file_name, client)))
+        if len(pending) >= max_concurrency:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            record_results(done)
+
+    while pending:
+        done, pending = await asyncio.wait(pending)
+        record_results(done)
+
+    return successes, failures
+
+
+async def export_part_file(file_path, file_name, msg_key, client, max_concurrency, stats=None):
+    """Stream a JSONL .part file to the queue."""
+    with jsonlines.open(file_path) as reader:
+        return await export_records(reader, msg_key, file_name, client, max_concurrency, stats)
+
+
+async def export_json_file(file_path, file_name, msg_key, client, max_concurrency, stats=None):
+    """Load a JSON array file and send each element to the queue."""
+    with open(file_path, "r") as f:
+        data = json.loads(f.read())
+    if not isinstance(data, list):
+        logger.warning(f"JSON file {file_name} does not contain a list, skipping...")
+        return 0, 0
+    return await export_records(iter(data), msg_key, file_name, client, max_concurrency, stats)
+
+
+async def monitor_send_progress(stats, stop_event):
+    """Log aggregate send counts every 2 seconds while export is running."""
     start_time = time.perf_counter()
-    
-    while completed_counter['count'] < total_tasks:
+    while not stop_event.is_set():
         await asyncio.sleep(2)
-        
-        completed = completed_counter['count']
-        
-        if completed < total_tasks:
-            elapsed = time.perf_counter() - start_time
-            progress = (completed / total_tasks) * 100
-            remaining = total_tasks - completed
-            
-            # Estimate remaining time
-            if completed > 0:
-                rate = completed / elapsed
-                eta = remaining / rate if rate > 0 else 0
-                logger.info(f"Progress: {completed}/{total_tasks} ({progress:.1f}%) - {remaining} remaining - ETA: {eta:.1f}s")
-            else:
-                logger.info(f"Progress: {completed}/{total_tasks} ({progress:.1f}%) - {remaining} remaining")
+        if stop_event.is_set():
+            break
+        sent = stats["successes"]
+        failed = stats["failures"]
+        elapsed = time.perf_counter() - start_time
+        if sent > 0 and elapsed > 0:
+            rate = sent / elapsed
+            logger.info(
+                f"Progress: {sent} sent, {failed} failed "
+                f"({rate:.0f} msg/s over {elapsed:.0f}s)"
+            )
+        else:
+            logger.info(f"Progress: {sent} sent, {failed} failed")
 
 
 async def upload(args):
     start_time = time.perf_counter()
     start_process_time = time.process_time()
-    
+
     logger.info(f"Exporting data...")
     config = args.config
     q_name = config['queue']
@@ -165,66 +180,64 @@ async def upload(args):
     connect_string = config['connect_string']
     msg_key = config['path_prefix']
 
+    export_files = _collect_export_files(local_path)
+    if not export_files:
+        logger.info("No files to process")
+        end_time = time.perf_counter()
+        end_process_time = time.process_time()
+        return end_time - start_time, end_process_time - start_process_time
+
+    file_count = len(export_files)
+    logger.info(f"Found {file_count} file(s) to export under {local_path}")
+
     client = get_queue_client(connect_string, q_name)
     async with client:
         global inflight_semaphore
         max_concurrency = int(config.get('max_concurrency', 1000))
         inflight_semaphore = asyncio.Semaphore(max_concurrency)
 
-        all_tasks = []
-        for root, _, files in os.walk(local_path):
-            # Handle queuing .part and .json files concurrently
-            part_files = [f for f in files if f.endswith(".part")]
-            json_files = [f for f in files if f.endswith(".json")]
-            
-            # Collect tasks from all files
-            for f in part_files:
-                tasks = process_part((msg_key, root, f, client))
-                all_tasks.extend(tasks)
-            
-            for f in json_files:
-                tasks = process_json((msg_key, root, f, client))
-                all_tasks.extend(tasks)
-        
-        if all_tasks:
-            total_tasks = len(all_tasks)
-            logger.info(f"Starting to send {total_tasks} total messages...")
-            
-            # Create a shared counter for progress monitoring
-            completed_counter = {'count': 0}
-            
-            # Start progress monitoring task
-            progress_task = asyncio.create_task(monitor_progress(completed_counter, total_tasks))
-            
-            # Execute all tasks with progress tracking
-            results = []
-            total_successes = 0
-            total_failures = 0
-            for coro in asyncio.as_completed(all_tasks):
-                result = await coro
-                results.append(result)
-                total_successes += 1 if result else 0
-                total_failures += 1 if not result else 0
-                completed_counter['count'] += 1
-            
-            # Cancel progress monitoring
+        stats = {"successes": 0, "failures": 0}
+        stop_event = asyncio.Event()
+        progress_task = asyncio.create_task(monitor_send_progress(stats, stop_event))
+
+        try:
+            for index, (file_path, file_name, kind) in enumerate(export_files, start=1):
+                logger.info(f"Exporting file {index}/{file_count}: {file_name}")
+                if kind == "part":
+                    sent, failed = await export_part_file(
+                        file_path, file_name, msg_key, client, max_concurrency, stats
+                    )
+                else:
+                    sent, failed = await export_json_file(
+                        file_path, file_name, msg_key, client, max_concurrency, stats
+                    )
+                logger.info(f"Finished {file_name}: {sent} sent, {failed} failed")
+        finally:
+            stop_event.set()
             progress_task.cancel()
-            
-            logger.info(f"All processing completed: {total_successes} messages sent, {total_failures} failed")
-            if total_failures > 0:
-                raise RuntimeError(f"Export failed: {total_failures}/{total_tasks} messages could not be sent to the queue")
-        else:
-            logger.info("No files to process")
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
+
+        logger.info(
+            f"All processing completed: {stats['successes']} messages sent, "
+            f"{stats['failures']} failed"
+        )
+        if stats["failures"] > 0:
+            raise RuntimeError(
+                f"Export failed: {stats['failures']} messages could not be sent to the queue"
+            )
 
     end_time = time.perf_counter()
     end_process_time = time.process_time()
-    
+
     total_wall_time = end_time - start_time
     total_process_time = end_process_time - start_process_time
-    
+
     logger.info(f"Data exported.")
     logger.info(f"Total upload time - Wall time: {total_wall_time:.2f} seconds, Process time: {total_process_time:.2f} seconds")
-    
+
     return total_wall_time, total_process_time
 
 def main():
@@ -232,7 +245,6 @@ def main():
     args = parse_args()
 
     # Upload the data
-    # print(timeit.repeat(lambda: asyncio.run(upload(args)), repeat=3, number=3))
     asyncio.run(upload(args))
 
 if __name__ == "__main__":
